@@ -8,9 +8,10 @@ Legacy packed rows remain accepted by the standalone wrappers.
 gfx942, which AITER's MXFP8 kernel does not serve, attends with a BF16 query instead, on a
 Triton kernel that decodes the planes in registers (`fp8_sparse_attention`)
 for split-KV launches (decode, short chunks) and during graph capture. Full-width
-prefill launches, where that kernel is slower, decode the rows each source
-contributes into bounded BF16 scratch for V4's BF16 attention, as the packed
-FP4 adapter does.
+prefill launches, where that kernel is slower, run the gfx942 HIP kernel over
+the planes when it applies (`fp8_sparse_attention_gfx942`); otherwise they
+decode the rows each source contributes into bounded BF16 scratch for V4's
+BF16 attention, as the packed FP4 adapter does.
 """
 
 import functools
@@ -29,7 +30,11 @@ from atom.model_ops.v4_kernels import (
 from atom.model_ops.v4_kernels.paged_2src import _csa_num_splits
 from atom.utils.decorators import mark_trace
 
-from .fp8_sparse_attention import _BLOCK_H, sparse_attn_v41_paged_2src_fp8kv
+from .fp8_sparse_attention import (
+    _BLOCK_H,
+    hip_applies,
+    sparse_attn_v41_paged_2src_fp8kv,
+)
 from .packed_rows import _read_plane
 
 # Decoded rows held at once by the BF16 adapter (256 MiB at D=512).
@@ -363,9 +368,20 @@ def sparse_attn_v41_paged_2src_bf16(
 ):
     """`sparse_attn_v41_paged_2src` for a BF16 `query` [T, H, D] over the
     same MXFP8 `(data, scale)` CSA and SWA planes."""
+    in_kernel = _in_kernel(query, kv_indices_prefix, kv_indices_extend) or hip_applies(
+        query,
+        pool,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        out,
+    )
     attend = (
         sparse_attn_v41_paged_2src_fp8kv
-        if _in_kernel(query, kv_indices_prefix, kv_indices_extend)
+        if in_kernel
         else sparse_attn_v41_paged_2src_gather
     )
     return attend(

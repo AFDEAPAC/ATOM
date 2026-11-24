@@ -694,6 +694,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # gfx942 FP8-KV attention on the HIP kernel (fp8 MFMA QK^T,
+    # fp8_sparse_attention_gfx942.py) from 6 tokens a call: decode splits and
+    # full-width prefill; 0 keeps Triton and the prefill BF16 scratch.
+    "ATOM_DSV41_FP8_KV_HIP": lambda: os.getenv("ATOM_DSV41_FP8_KV_HIP", "1") == "1",
     # Direct NVFP4 CSA / MXFP8 SWA attention; off retains the BF16 adapter.
     "ATOM_DSV41_A8W4_ATTN": lambda: os.getenv("ATOM_DSV41_A8W4_ATTN", "auto")
     .strip()

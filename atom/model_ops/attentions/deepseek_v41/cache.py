@@ -37,6 +37,7 @@ from atom.model_ops.v4_kernels.state_writes import swa_write
 from atom.utils import CpuGpuBuffer, upload_numpy
 
 from .fp8_attention import native_fp8_attention
+from .fp8_sparse_attention import warm_up_hip
 from .indices import (
     build_indices,
     build_window_rows,
@@ -179,6 +180,8 @@ class PagedAttentionCache:
         self.window_fp8 = geometry.window_fp8
         # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`
         self.kv_fp8 = geometry.kv_dtype == "fp8"
+        if self.kv_fp8 and not native_fp8_attention():
+            warm_up_hip(device)
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         if self.window_fp8:
             self._allocate_quantized(device)
