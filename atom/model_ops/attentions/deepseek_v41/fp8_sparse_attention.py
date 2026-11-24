@@ -12,6 +12,7 @@ combine and sink. No scratch, no host reads.
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_TL_DTYPE
 from atom.model_ops.v4_kernels.paged_2src import (
@@ -20,7 +21,9 @@ from atom.model_ops.v4_kernels.paged_2src import (
     _sparse_attn_v4_split_combine_kernel,
 )
 from atom.model_ops.v4_kernels.pool_index import row_offset
+from atom.utils import envs
 
+from . import fp8_sparse_attention_gfx942 as _hip
 from .packed_rows import _e8m0
 
 _BLOCK_H = 16
@@ -28,6 +31,17 @@ _BLOCK_K = 32
 _SPLIT_BLOCK_K = 16
 _NUM_WARPS = 4
 _NUM_STAGES = 1
+# The HIP kernel only wins from this many query tokens a call (DSpark verify,
+# multi-request decode); below it Triton is as fast or faster.
+_HIP_MIN_TOKENS = 6
+# Split counts of the HIP kernel: about 160 (token, split) pairs, two per CTA.
+_HIP_SPLITS = (20, 10, 5, 3, 2)
+_HIP_PAIRS = 160
+
+
+def _hip_num_splits(tokens, avg_keys):
+    cap = max(1, int(avg_keys // 32))
+    return next((s for s in _HIP_SPLITS if tokens * s <= _HIP_PAIRS and s <= cap), 1)
 
 
 @triton.jit
@@ -182,6 +196,38 @@ def _mxfp8_2src_kernel(
         tl.store(part_ml_ptr + row * 2 + 1, l_i, mask=h_mask)
 
 
+def warm_up_hip(device):
+    """Build the gfx942 HIP kernel for `device` now, before any graph capture."""
+    if envs.ATOM_DSV41_FP8_KV_HIP and get_gfx() == "gfx942":
+        _hip.warm_up(device)
+
+
+def hip_applies(
+    query,
+    pool,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv,
+    kv_indices_extend,
+    kv_indptr_extend,
+):
+    """Whether `sparse_attn_v41_paged_2src_fp8kv` takes the gfx942 HIP kernel
+    for this call: switch on, at least `_HIP_MIN_TOKENS` query tokens,
+    contiguous int32 CSR lists, gfx942, and the kernel built."""
+    lists = (kv_indices_prefix, kv_indptr_prefix, kv_indices_extend, kv_indptr_extend)
+    return (
+        envs.ATOM_DSV41_FP8_KV_HIP
+        and query.shape[0] >= _HIP_MIN_TOKENS
+        and all(t.dtype == torch.int32 and t.is_contiguous() for t in lists)
+        and get_gfx() == "gfx942"
+        and _hip.applies(
+            query,
+            tuple(plane.view(torch.uint8) for plane in pool),
+            tuple(plane.view(torch.uint8) for plane in kv),
+        )
+    )
+
+
 def sparse_attn_v41_paged_2src_fp8kv(
     query,
     pool,
@@ -212,11 +258,28 @@ def sparse_attn_v41_paged_2src_fp8kv(
     pool_data, pool_scale = (plane.view(torch.uint8) for plane in pool)
     kv_data, kv_scale = (plane.view(torch.uint8) for plane in kv)
     head_blocks = triton.cdiv(heads, _BLOCK_H)
+    avg_keys = (kv_indices_prefix.numel() + kv_indices_extend.numel()) / tokens
+    hip_splits = num_splits or _hip_num_splits(tokens, avg_keys)
+    # One split (prefill widths, including captured token-graph buckets) stays
+    # on Triton: the HIP kernel only pays off on split-KV decode.
+    use_hip = (
+        hip_splits > 1
+        and block_k is None
+        and split_block_k is None
+        and num_warps is None
+        and hip_applies(
+            query,
+            pool,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+        )
+    )
     if num_splits is None:
-        num_splits = _csa_num_splits(
-            tokens,
-            head_blocks,
-            (kv_indices_prefix.numel() + kv_indices_extend.numel()) / tokens,
+        num_splits = (
+            hip_splits if use_hip else _csa_num_splits(tokens, head_blocks, avg_keys)
         )
     split = num_splits > 1
     if split:
@@ -228,38 +291,53 @@ def sparse_attn_v41_paged_2src_fp8kv(
         )
     else:
         part_acc = part_ml = out
-    meta = {
-        "NUM_SPLITS": num_splits,
-        "BLOCK_H": _BLOCK_H,
-        "D": dim,
-        "BLOCK_K": (
-            (split_block_k or _SPLIT_BLOCK_K) if split else (block_k or _BLOCK_K)
-        ),
-        "num_warps": num_warps or _NUM_WARPS,
-        "num_stages": _NUM_STAGES,
-    }
-    _mxfp8_2src_kernel[(tokens, head_blocks, num_splits)](
-        query,
-        pool_data,
-        pool_scale,
-        kv_indices_prefix,
-        kv_indptr_prefix,
-        kv_data,
-        kv_scale,
-        kv_indices_extend,
-        kv_indptr_extend,
-        attn_sink,
-        out,
-        part_acc,
-        part_ml,
-        query.stride(0),
-        query.stride(1),
-        out.stride(0),
-        out.stride(1),
-        heads,
-        float(softmax_scale),
-        **meta,
-    )
+    if use_hip:
+        _hip.split_partials(
+            query,
+            (pool_data, pool_scale),
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            (kv_data, kv_scale),
+            kv_indices_extend,
+            kv_indptr_extend,
+            softmax_scale,
+            num_splits,
+            part_acc,
+            part_ml,
+        )
+    else:
+        meta = {
+            "NUM_SPLITS": num_splits,
+            "BLOCK_H": _BLOCK_H,
+            "D": dim,
+            "BLOCK_K": (
+                (split_block_k or _SPLIT_BLOCK_K) if split else (block_k or _BLOCK_K)
+            ),
+            "num_warps": num_warps or _NUM_WARPS,
+            "num_stages": _NUM_STAGES,
+        }
+        _mxfp8_2src_kernel[(tokens, head_blocks, num_splits)](
+            query,
+            pool_data,
+            pool_scale,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv_data,
+            kv_scale,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            out,
+            part_acc,
+            part_ml,
+            query.stride(0),
+            query.stride(1),
+            out.stride(0),
+            out.stride(1),
+            heads,
+            float(softmax_scale),
+            **meta,
+        )
     if split:
         _sparse_attn_v4_split_combine_kernel[
             (tokens, head_blocks, triton.cdiv(dim, _COMBINE_BLOCK_DC))
